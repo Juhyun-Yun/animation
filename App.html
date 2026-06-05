@@ -1,0 +1,460 @@
+<script>
+/* =========================================================
+ *  우리 반 애니메이션 스튜디오 — 클라이언트 (1/2)
+ *  페이지 넘김 구조 · 서버통신 · 입장 · 학습(2쪽) · 계획(2쪽)
+ * ========================================================= */
+window.S = window.S || {};
+(function (S) {
+  'use strict';
+
+  /* ---------- 페이지 흐름 ---------- */
+  S.STEPS = ['입장', '학습', '계획', '촬영', '평가', '보드'];
+  S.FLOW = [
+    { key: 'entry',    screen: 'entry',    step: 0 },
+    { key: 'home',     screen: 'home',     step: 0 },
+    { key: 'learn1',   screen: 'learn',    sub: 0, step: 1 },
+    { key: 'learn2',   screen: 'learn',    sub: 1, step: 1 },
+    { key: 'learn3',   screen: 'learn',    sub: 2, step: 1 },
+    { key: 'learn4',   screen: 'learn',    sub: 3, step: 1 },
+    { key: 'learn5',   screen: 'learn',    sub: 4, step: 1 },
+    { key: 'plan1',    screen: 'plan',     sub: 0, step: 2 },
+    { key: 'plan2',    screen: 'plan',     sub: 1, step: 2 },
+    { key: 'capture',  screen: 'capture',  step: 3 },
+    { key: 'selfeval', screen: 'selfeval', step: 4 },
+    { key: 'board',    screen: 'board',    step: 5 }
+  ];
+  S.curIndex = 0;
+
+  /* ---------- 상태 ---------- */
+  S.state = {
+    student: null,
+    plan: { title: '', story: '', cells: ['', '', '', ''] },
+    frames: [],
+    fps: 6,
+    screen: 'entry',
+    sub: 0
+  };
+
+  /* =========================================================
+   *  서버 통신 (google.script.run) — 없으면 모의(MOCK) 사용
+   * ========================================================= */
+  S.call = function (name) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    if (window.google && google.script && google.script.run) {
+      return new Promise(function (resolve, reject) {
+        var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(function (e) { reject(e); });
+        runner[name].apply(runner, args);
+      });
+    }
+    if (typeof MOCK !== 'undefined' && MOCK[name]) {
+      try { return Promise.resolve(MOCK[name].apply(null, args)); }
+      catch (e) { return Promise.reject(e); }
+    }
+    return Promise.reject(new Error('서버 함수를 찾을 수 없어요: ' + name));
+  };
+
+  /* =========================================================
+   *  도우미
+   * ========================================================= */
+  S.app = function () { return document.getElementById('app'); };
+  S.esc = function (s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  };
+  S.errText = function (e) { return (e && (e.message || e.toString())) || '알 수 없는 오류'; };
+
+  S.toast = function (msg, ms) {
+    var t = document.getElementById('toast');
+    t.textContent = msg; t.classList.remove('hidden');
+    clearTimeout(S._toastTimer);
+    S._toastTimer = setTimeout(function () { t.classList.add('hidden'); }, ms || 2200);
+  };
+  S.loading = function (on, text) {
+    if (text) document.getElementById('loadingText').textContent = text;
+    document.getElementById('loading').classList.toggle('hidden', !on);
+  };
+  S.pushTimer = function (t) { (S._timers = S._timers || []).push(t); };
+
+  /* ---------- 페이지 렌더 ---------- */
+  S.page = function (body, opts) {
+    opts = opts || {};
+    var head = opts.head || (opts.title
+      ? '<div class="page__head"><h1 class="page__title">' + opts.title + '</h1>' +
+        (opts.sub ? '<p class="page__sub">' + opts.sub + '</p>' : '') + '</div>'
+      : '');
+    S.app().innerHTML = '<div class="page dir-' + (S._dir || 'next') + '">' +
+      head + '<div class="page__body">' + body + '</div></div>';
+  };
+
+  /* ---------- 아래 이동 바 ---------- */
+  S.setNav = function (cfg) {
+    var nav = document.getElementById('navbar');
+    cfg = cfg || {};
+    if (!cfg.back && !cfg.next && !cfg.center) { nav.classList.add('hidden'); nav.innerHTML = ''; return; }
+    nav.classList.remove('hidden');
+    var left = cfg.back ? '<button class="btn ghost" id="navBack">' + cfg.back.label + '</button>' : '<span></span>';
+    var center = '<div class="nav-center">' + (cfg.center || '') + '</div>';
+    var right = cfg.next ? '<button class="btn ' + (cfg.next.cls || 'accent') + '" id="navNext"' + (cfg.next.disabled ? ' disabled' : '') + '>' + cfg.next.label + '</button>' : '<span></span>';
+    nav.innerHTML = left + center + right;
+    if (cfg.back) document.getElementById('navBack').onclick = cfg.back.fn;
+    if (cfg.next) document.getElementById('navNext').onclick = cfg.next.fn;
+  };
+  S.setNextDisabled = function (b) { var n = document.getElementById('navNext'); if (n) n.disabled = b; };
+
+  /* ---------- 상단 바 ---------- */
+  S.renderTopbar = function (step) {
+    var bar = document.getElementById('topbar');
+    if (!S.state.student) { bar.classList.add('hidden'); return; }
+    bar.classList.remove('hidden');
+    document.getElementById('whoami').textContent = '👋 ' + S.state.student.name;
+    document.getElementById('stepDots').innerHTML = S.STEPS.map(function (lbl, i) {
+      var cls = 'step-dot' + (i === step ? ' active' : (i < step ? ' done' : ''));
+      return '<span class="' + cls + '">' + (i < step ? '✓' : (i + 1)) + '<span class="lbl"> ' + lbl + '</span></span>';
+    }).join('');
+  };
+  S.bindTopbar = function () {
+    document.getElementById('homeBtn').onclick = function () { S.go(S.state.student ? 'home' : 'entry'); };
+    document.getElementById('boardBtn').onclick = function () { S.go('board'); };
+    document.getElementById('settingsBtn').onclick = function () { S.teacherSettings(); };
+  };
+
+  /* ---------- 이동 ---------- */
+  S.gotoIndex = function (i, dir) {
+    if (i < 0 || i >= S.FLOW.length) return;
+    var f = S.FLOW[i];
+    if (f.screen !== 'entry' && !S.state.student) { i = 0; f = S.FLOW[0]; }
+    S.curIndex = i;
+    S.state.screen = f.screen; S.state.sub = f.sub || 0;
+    S._dir = dir || 'next';
+    if (S.stopPlayers) S.stopPlayers();
+    S.renderTopbar(f.step);
+    window.scrollTo(0, 0);
+    switch (f.screen) {
+      case 'entry':    S.screenEntry(); break;
+      case 'home':     S.screenHome(); break;
+      case 'learn':    S.screenLearn(f.sub || 0); break;
+      case 'plan':     S.screenPlan(f.sub || 0); break;
+      case 'capture':  S.screenCapture(); break;
+      case 'selfeval': S.screenSelfEval(); break;
+      case 'board':    S.screenBoard(); break;
+    }
+  };
+  S.next = function () { S.gotoIndex(S.curIndex + 1, 'next'); };
+  S.prev = function () { S.gotoIndex(S.curIndex - 1, 'prev'); };
+  S.gotoKey = function (key, dir) {
+    for (var i = 0; i < S.FLOW.length; i++) if (S.FLOW[i].key === key) { S.gotoIndex(i, dir); return; }
+  };
+  S.go = function (screen) {
+    for (var i = 0; i < S.FLOW.length; i++) if (S.FLOW[i].screen === screen) {
+      S.gotoIndex(i, i >= S.curIndex ? 'next' : 'prev'); return;
+    }
+  };
+
+  /* ---------- 이미지: 사진 → 작은 컷 ---------- */
+  S.fileToFrame = function (file, maxW) {
+    maxW = maxW || 480;
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(S.dataUrlToFrame(reader.result, maxW)); };
+      reader.onerror = function () { reject(new Error('사진을 읽지 못했어요.')); };
+      reader.readAsDataURL(file);
+    });
+  };
+  S.dataUrlToFrame = function (dataUrl, maxW) {
+    maxW = maxW || 480;
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () {
+        var scale = Math.min(1, maxW / img.width);
+        var w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(cv.toDataURL('image/jpeg', 0.55));
+      };
+      img.onerror = function () { reject(new Error('사진을 처리하지 못했어요.')); };
+      img.src = dataUrl;
+    });
+  };
+  S.makeThumb = function (dataUrl, size) {
+    size = size || 150;
+    return new Promise(function (resolve) {
+      var img = new Image();
+      img.onload = function () {
+        var scale = size / Math.max(img.width, img.height);
+        var w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(cv.toDataURL('image/jpeg', 0.5));
+      };
+      img.onerror = function () { resolve(dataUrl); };
+      img.src = dataUrl;
+    });
+  };
+
+  /* =========================================================
+   *  ① 입장
+   * ========================================================= */
+  S.screenEntry = function () {
+    S.setNav({});
+    S.loading(true, '명단을 불러오는 중…');
+    S.call('apiGetRoster').then(function (roster) {
+      S.loading(false);
+      if (!roster || roster.length === 0) {
+        S.page(
+          '<div class="center-col"><div class="logo">🎬</div>' +
+          '<div class="card" style="text-align:center;max-width:34rem;">' +
+            '<p style="font-size:1.2rem;">아직 학생 명단이 없어요.<br>선생님께서 오른쪽 위 ⚙️ 를 눌러 명단을 등록해 주세요.</p>' +
+            '<button class="btn" onclick="S.teacherSettings()">⚙️ 선생님 설정 열기</button>' +
+          '</div></div>',
+          { title: '우리 반 애니메이션 스튜디오' }
+        );
+        document.getElementById('topbar').classList.remove('hidden');
+        document.getElementById('whoami').textContent = '';
+        document.getElementById('stepDots').innerHTML = '';
+        return;
+      }
+      var cards = roster.map(function (st) {
+        return '<button class="name-card" data-id="' + S.esc(st.id) + '" data-name="' + S.esc(st.name) + '" data-num="' + S.esc(st.number) + '">' +
+          '<span class="num">' + S.esc(st.number) + '번</span>' + S.esc(st.name) + '</button>';
+      }).join('');
+      S.page(
+        '<div class="logo" style="text-align:center;">🎬</div>' +
+        '<div class="scroll-area"><div class="roster-grid">' + cards + '</div></div>',
+        { title: '내 이름을 눌러 입장해요!', sub: '명단에서 자기 이름을 찾아 누르세요' }
+      );
+      document.getElementById('topbar').classList.remove('hidden');
+      document.getElementById('whoami').textContent = '';
+      document.getElementById('stepDots').innerHTML = '';
+      Array.prototype.forEach.call(document.querySelectorAll('.name-card'), function (b) {
+        b.onclick = function () {
+          S.state.student = { id: b.dataset.id, name: b.dataset.name, number: b.dataset.num };
+          localStorage.setItem('anim_student', JSON.stringify(S.state.student));
+          S.toast(S.state.student.name + '님, 환영해요! 🎉');
+          S.gotoKey('home', 'next');
+        };
+      });
+    }).catch(function (e) {
+      S.loading(false);
+      S.page('<div class="center-col"><div class="card"><h2>이런!</h2><p>' + S.esc(S.errText(e)) +
+        '</p><button class="btn" onclick="S.go(\'entry\')">다시 시도</button></div></div>', { title: '문제가 생겼어요' });
+    });
+  };
+
+  /* =========================================================
+   *  여정 홈 (카드형 허브)
+   * ========================================================= */
+  S.screenHome = function () {
+    S.setNav({});
+    document.getElementById('stepDots').innerHTML = '';
+    var name = S.state.student ? S.state.student.name : '친구';
+    var render = function (works, hearts) {
+      var medals = works > 0 ? 1 : 0;
+      var head =
+        '<div class="home__head">' +
+          '<div class="mascot">🎬</div>' +
+          '<div class="home__hi">' +
+            '<div class="home__title">우리 반 애니메이션 스튜디오</div>' +
+            '<div class="home__greet">안녕, <b>' + S.esc(name) + '</b> 감독님!</div>' +
+          '</div>' +
+          '<div class="badges">' +
+            badge('🎬', '내 작품', works) + badge('❤️', '받은 하트', hearts) + badge('🏅', '메달', medals) +
+          '</div>' +
+        '</div>';
+      S.page(
+        '<div class="hub-row">' +
+          hub(1, 'orange', '📚', '애니메이션 배우기', '원리와 만드는 법을 알아봐요', 'learn1') +
+          '<div class="hub-arrow">→</div>' +
+          hub(2, 'green', '🎥', '나만의 애니 만들기', '계획하고 사진 찍어 영상으로!', 'plan1') +
+          '<div class="hub-arrow">→</div>' +
+          hub(3, 'yellow', '🖼️', '친구 작품 보드', '감상하고 하트·댓글로 응원해요', 'board') +
+        '</div>' +
+        '<div class="home__hint">💡 1 → 2 차례로 만들고, 3 보드에서 친구들과 작품을 함께 봐요!</div>',
+        { head: head }
+      );
+      Array.prototype.forEach.call(document.querySelectorAll('.hub-start'), function (b) {
+        b.onclick = function () { S.gotoKey(b.dataset.go, 'next'); };
+      });
+    };
+    render(0, 0);
+    S.call('apiListAnimations').then(function (list) {
+      var mine = (list || []).filter(function (a) { return S.state.student && a.studentId === S.state.student.id; });
+      var hearts = mine.reduce(function (s, a) { return s + (a.hearts || 0); }, 0);
+      if (S.state.screen === 'home') render(mine.length, hearts);
+    }).catch(function () {});
+
+    function badge(ic, label, val) {
+      return '<div class="badge">' + ic + ' <span class="v">' + val + '</span><span class="l">' + label + '</span></div>';
+    }
+    function hub(n, color, icon, title, sub, go) {
+      return '<div class="hub-card ' + color + '"><span class="hub-num">' + n + '</span>' +
+        '<div class="hub-icon">' + icon + '</div><div class="hub-title">' + title + '</div>' +
+        '<div class="hub-sub">' + sub + '</div>' +
+        '<button class="hub-start" data-go="' + go + '">시작하기 →</button></div>';
+    }
+  };
+
+  /* =========================================================
+   *  ② 학습 (설명 4쪽 + 플립 4단계 1쪽 = 5쪽)
+   * ========================================================= */
+  S.LEARN_FACTS = [
+    { emoji: '👁️', title: '① 잔상 효과', paras: [
+        '우리 눈은 한 번 본 그림을 약 <b>1/16초</b> 동안 기억해요. 이것을 <b>잔상 효과</b>라고 해요.',
+        '그래서 조금씩 다른 그림을 빠르게 이어서 보여주면, 눈이 그 사이를 스스로 메워서 <b>“움직인다”</b>고 느껴요.',
+        '옛날에는 새와 새장을 동전 양면에 그려 빙글빙글 돌렸더니, 새가 새장 안에 들어간 것처럼 보였대요. (소마트로프)'
+      ], tip: '애니메이션은 마술이 아니라, 우리 눈의 성질을 똑똑하게 이용한 거예요!' },
+    { emoji: '🖼️', title: '② 컷(프레임)', paras: [
+        '애니메이션은 사진(그림) <b>여러 장</b>으로 만들어져요. 그 한 장 한 장을 <b>컷</b> 또는 <b>프레임</b>이라고 불러요.',
+        '각 컷은 바로 앞 컷과 <b>아주 조금만</b> 달라야 해요. 많이 달라지면 화면이 뚝뚝 끊겨 보여요.',
+        '예를 들어 팔을 드는 장면이라면, 팔을 조금씩 위로 올린 컷을 여러 장 찍으면 돼요.'
+      ], tip: '“조금씩, 여러 장”이 가장 중요한 비밀이에요.' },
+    { emoji: '⚡', title: '③ 속도 (컷/초)', paras: [
+        '1초에 컷을 <b>몇 장</b> 보여줄지를 <b>fps(초당 프레임 수)</b>라고 해요.',
+        '컷이 많을수록(빠를수록) 더 <b>부드럽게</b>, 적을수록 <b>통통 튀는</b> 느낌이 나요.',
+        '우리 앱에서는 🐢~🐇 막대로 1초에 <b>2~15장</b>까지 정할 수 있어요. 보통 <b>6~8장</b>이면 좋아요.'
+      ], tip: '같은 사진이라도 속도를 바꾸면 느낌이 확 달라져요.' },
+    { emoji: '📒', title: '④ 플립북', paras: [
+        '공책 귀퉁이마다 조금씩 다른 그림을 그리고 <b>촤르륵</b> 넘기면 그림이 움직여요. 이것이 <b>플립북</b>이에요.',
+        '우리는 그림 대신 <b>사진</b>을 찍어서 “디지털 플립북”을 만들 거예요.',
+        '인형·블록·점토·종이 그림을 <b>조금씩 움직이며</b> 한 컷씩 사진을 찍으면 멋진 애니메이션이 완성돼요!'
+      ], tip: '다음 쪽에서 우리가 만들 4단계를 살펴봐요 →' }
+  ];
+
+  S.screenLearn = function (sub) {
+    var TOTAL = 5;
+    if (sub < 4) {
+      var f = S.LEARN_FACTS[sub];
+      S.page(
+        '<div class="fact-page">' +
+          '<div class="fact-visual"><div class="fact-emoji">' + f.emoji + '</div></div>' +
+          '<div class="fact-text">' +
+            f.paras.map(function (p) { return '<p>' + p + '</p>'; }).join('') +
+            '<div class="fact-tip">💡 ' + f.tip + '</div>' +
+          '</div>' +
+        '</div>',
+        { title: f.title + ' ' + f.emoji }
+      );
+      S.setNav({
+        back: sub === 0 ? { label: '🏠 홈', fn: function () { S.go('home'); } } : { label: '◀ 이전', fn: S.prev },
+        center: (sub + 1) + ' / ' + TOTAL,
+        next: { label: '다음 ▶', fn: S.next }
+      });
+    } else {
+      S.page(
+        '<div class="flip-layout">' +
+          '<div class="flip-left">' +
+            '<div id="flipStage" class="flip-stage">🙂</div>' +
+            '<button class="btn" id="playFlip">▶ 움직임 미리보기</button>' +
+          '</div>' +
+          '<div class="flip-right"><ol class="toc">' +
+            step(1, '📝', '계획 세우기', '이야기를 정하고 컷을 나눠요') +
+            step(2, '📸', '사진 찍기', '조금씩 움직이며 한 컷씩 찍어요') +
+            step(3, '🎞️', '컷 이어붙이기', '순서대로 놓고 속도를 정해요') +
+            step(4, '🖼️', '함께 감상', '보드에 올려 친구들과 봐요') +
+          '</ol></div>' +
+        '</div>',
+        { title: '플립 애니메이션 4단계 🎞️' }
+      );
+      var faces = ['🙂', '😊', '😄', '😁', '😆', '😄', '😊', '🙂'];
+      var stage = document.getElementById('flipStage');
+      var fi = 0, timer = null;
+      document.getElementById('playFlip').onclick = function () {
+        if (timer) { clearInterval(timer); timer = null; this.textContent = '▶ 움직임 미리보기'; return; }
+        this.textContent = '⏸ 멈추기';
+        timer = setInterval(function () { fi = (fi + 1) % faces.length; stage.textContent = faces[fi]; }, 150);
+        S.pushTimer(timer);
+      };
+      Array.prototype.forEach.call(document.querySelectorAll('.toc li'), function (li) {
+        li.onclick = function () {
+          Array.prototype.forEach.call(document.querySelectorAll('.toc li'), function (x) { x.classList.remove('active'); });
+          li.classList.add('active');
+          stage.textContent = li.dataset.emoji;
+        };
+      });
+      S.setNav({
+        back: { label: '◀ 이전', fn: S.prev },
+        center: '5 / ' + TOTAL,
+        next: { label: '내 계획 세우기 ▶', fn: S.next }
+      });
+    }
+
+    function step(n, emoji, title, desc) {
+      return '<li data-emoji="' + emoji + '"><span class="n">' + n + '</span>' +
+        '<span class="toc-txt"><span class="t">' + emoji + ' ' + title + '</span>' +
+        '<span class="d">' + desc + '</span></span></li>';
+    }
+  };
+
+  /* =========================================================
+   *  ③ 계획 (2쪽)
+   * ========================================================= */
+  S.screenPlan = function (sub) {
+    var p = S.state.plan;
+    if (sub === 0) {
+      S.page(
+        '<div class="center-col" style="justify-content:flex-start;">' +
+          '<div class="card" style="width:100%;max-width:40rem;">' +
+            '<label class="field">🎬 작품 제목</label>' +
+            '<input type="text" id="planTitle" maxlength="40" placeholder="예) 점프하는 우리 강아지" value="' + S.esc(p.title) + '">' +
+            '<label class="field">📖 어떤 이야기인가요? (무엇이 어떻게 움직이나요)</label>' +
+            '<textarea id="planStory" rows="4" maxlength="300" placeholder="예) 강아지가 앉아 있다가 점점 일어나 폴짝 뛴다.">' + S.esc(p.story) + '</textarea>' +
+          '</div>' +
+        '</div>',
+        { title: '애니메이션 계획 📝', sub: '제목과 이야기를 정해요' }
+      );
+      document.getElementById('planTitle').oninput = function () { p.title = this.value; };
+      document.getElementById('planStory').oninput = function () { p.story = this.value; };
+      S.setNav({
+        back: { label: '◀ 이전', fn: S.prev },
+        center: '1 / 2 쪽',
+        next: { label: '컷 짜기 ▶', fn: function () {
+          p.title = (document.getElementById('planTitle').value || '').trim();
+          p.story = (document.getElementById('planStory').value || '').trim();
+          if (!p.title) { S.toast('작품 제목을 먼저 정해주세요 🙂'); document.getElementById('planTitle').focus(); return; }
+          S.next();
+        } }
+      });
+    } else {
+      if (!p.cells.length) p.cells = ['', '', '', ''];
+      S.page(
+        '<div class="scroll-area"><div class="storyboard" id="sbGrid"></div>' +
+          '<div class="btn-row" style="margin-top:.8rem;justify-content:center;">' +
+            '<button class="btn ghost" id="addCell">➕ 컷 추가</button>' +
+            '<span class="page__sub" id="cellCount"></span>' +
+          '</div></div>',
+        { title: '컷 계획 (스토리보드) 🗂️', sub: '컷마다 어떤 장면을 찍을지 적어요' }
+      );
+      drawCells();
+      document.getElementById('addCell').onclick = function () { p.cells.push(''); drawCells(); };
+      S.setNav({
+        back: { label: '◀ 이전', fn: S.prev },
+        center: '2 / 2 쪽',
+        next: { label: '촬영하러 가기 📸', fn: S.next }
+      });
+    }
+
+    function drawCells() {
+      var grid = document.getElementById('sbGrid');
+      grid.innerHTML = p.cells.map(function (c, i) {
+        return '<div class="sb-cell"><div class="sb-num"><span>컷 ' + (i + 1) + '</span>' +
+          (p.cells.length > 1 ? '<button class="del" data-del="' + i + '">✕ 삭제</button>' : '') + '</div>' +
+          '<textarea data-cell="' + i + '" rows="3" maxlength="120" placeholder="이 컷의 장면">' + S.esc(c) + '</textarea></div>';
+      }).join('');
+      document.getElementById('cellCount').textContent = '계획한 컷: ' + p.cells.length + '개';
+      Array.prototype.forEach.call(grid.querySelectorAll('textarea'), function (ta) {
+        ta.oninput = function () { p.cells[parseInt(ta.dataset.cell, 10)] = ta.value; };
+      });
+      Array.prototype.forEach.call(grid.querySelectorAll('[data-del]'), function (b) {
+        b.onclick = function () { p.cells.splice(parseInt(b.dataset.del, 10), 1); drawCells(); };
+      });
+    }
+  };
+
+  /* ---------- 부팅 공통 ---------- */
+  S.bootCommon = function () {
+    var saved = localStorage.getItem('anim_student');
+    if (saved) { try { S.state.student = JSON.parse(saved); } catch (e) {} }
+    S.bindTopbar();
+  };
+
+})(window.S);
+</script>
+<!-- App.html 끝 -->

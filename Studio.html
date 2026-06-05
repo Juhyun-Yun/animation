@@ -1,0 +1,634 @@
+<script>
+/* =========================================================
+ *  우리 반 애니메이션 스튜디오 — 클라이언트 (2/2)
+ *  촬영 · 자기평가 · 보드 · 감상 · 선생님 설정 · 미리보기 모의데이터
+ * ========================================================= */
+(function (S) {
+  'use strict';
+
+  /* ---------- 영상 재생기 ---------- */
+  S._timers = [];
+  S._stream = null;
+  S.stopPlayers = function () {
+    (S._timers || []).forEach(function (t) { clearInterval(t); });
+    S._timers = [];
+    if (S._stream) { S._stream.getTracks().forEach(function (tr) { tr.stop(); }); S._stream = null; }
+  };
+  S.stopPlayersKeepCamera = function () {
+    (S._timers || []).forEach(function (t) { clearInterval(t); });
+    S._timers = [];
+  };
+  function fit(ctx, cv, img) {
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cv.width, cv.height);
+    if (!img || !img.width) return;
+    var s = Math.min(cv.width / img.width, cv.height / img.height);
+    var w = img.width * s, h = img.height * s;
+    ctx.drawImage(img, (cv.width - w) / 2, (cv.height - h) / 2, w, h);
+  }
+  S.playOn = function (canvas, frames, fps) {
+    if (!canvas || !frames || !frames.length) return;
+    canvas.width = 480; canvas.height = 360;
+    var ctx = canvas.getContext('2d');
+    var imgs = frames.map(function (src) { var im = new Image(); im.src = src; return im; });
+    var i = 0;
+    var tick = function () { fit(ctx, canvas, imgs[i]); i = (i + 1) % imgs.length; };
+    tick();
+    S.pushTimer(setInterval(tick, 1000 / Math.max(1, fps)));
+  };
+
+  function renderStars(node, value, onset) {
+    if (!node) return;
+    function paint() {
+      node.innerHTML = '';
+      for (var s = 1; s <= 5; s++) {
+        var sp = document.createElement('span');
+        sp.className = 'star' + (s <= value ? ' on' : '');
+        sp.textContent = '★';
+        (function (n) { sp.onclick = function () { value = n; onset(n); paint(); }; })(s);
+        node.appendChild(sp);
+      }
+    }
+    paint();
+  }
+
+  /* =========================================================
+   *  ④ 촬영 스튜디오 (촬영 / 미리보기 탭)
+   * ========================================================= */
+  S.screenCapture = function () {
+    S.page(
+      '<div class="tabbar">' +
+        '<button class="tab active" data-tab="shoot">📸 촬영</button>' +
+        '<button class="tab" data-tab="preview">▶ 미리보기</button>' +
+      '</div>' +
+      '<div class="cap-wrap" id="capShoot">' +
+        '<div class="capture-box">' +
+          '<video id="cam" autoplay playsinline muted></video>' +
+          '<img id="onion" class="onion hidden" alt="">' +
+          '<div id="capEmpty" class="capture-empty hidden">📷 아래 “사진 찍기”로<br>카메라를 열어 촬영하세요</div>' +
+        '</div>' +
+        '<div class="btn-row" style="justify-content:center;flex:none;gap:.5rem;">' +
+          '<button class="btn green sm" id="shotBtn">📸 찰칵!</button>' +
+          '<label class="btn ghost sm">🖼️ 가져오기' +
+            '<input type="file" id="fileInput" accept="image/*" capture="environment" multiple class="hidden">' +
+          '</label>' +
+        '</div>' +
+      '</div>' +
+      '<div class="cap-wrap hidden" id="capPreview">' +
+        '<canvas id="preview" class="player-canvas"></canvas>' +
+        '<div class="speed-row"><span>🐢</span><input type="range" id="fps" min="2" max="15" step="1" value="' + S.state.fps + '">' +
+          '<span>🐇</span><b id="fpsVal" style="font-size:1.1rem;min-width:5rem;text-align:right;">' + S.state.fps + ' 컷/초</b></div>' +
+      '</div>' +
+      '<div class="frames-strip" id="strip"></div>',
+      { title: '사진 찍어 영상 만들기 📸' }
+    );
+
+    S._capTab = 'shoot';
+    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+      t.onclick = function () { S.captureTab(t.dataset.tab); };
+    });
+
+    S.initCamera();
+    S.drawFrames();
+
+    document.getElementById('shotBtn').onclick = S.shoot;
+    document.getElementById('fileInput').onchange = function (e) {
+      var files = Array.prototype.slice.call(e.target.files || []);
+      if (!files.length) return;
+      S.loading(true, '사진을 넣는 중…');
+      files.reduce(function (chain, f) {
+        return chain.then(function () { return S.fileToFrame(f).then(function (fr) { S.state.frames.push(fr); }); });
+      }, Promise.resolve()).then(function () {
+        S.loading(false); S.afterFrameChange(); S.toast('컷 ' + files.length + '장 추가! 📥'); e.target.value = '';
+      }).catch(function (err) { S.loading(false); S.toast(S.errText(err)); });
+    };
+    document.getElementById('fps').oninput = function () {
+      S.state.fps = parseInt(this.value, 10);
+      document.getElementById('fpsVal').textContent = S.state.fps + ' 컷/초';
+      if (S._capTab === 'preview') S.refreshPreview();
+    };
+
+    S.updateCaptureNav();
+  };
+
+  S.updateCaptureNav = function () {
+    var enough = S.state.frames.length >= 2;
+    S.setNav({
+      back: { label: '◀ 계획', fn: S.prev },
+      center: '찍은 컷 ' + S.state.frames.length + '개',
+      next: { label: '자기평가 ▶', cls: 'accent', disabled: !enough, fn: function () {
+        if (S.state.frames.length < 2) { S.toast('컷이 2장 이상 있어야 영상이 돼요 🙂'); return; }
+        S.next();
+      } }
+    });
+  };
+
+  S.captureTab = function (name) {
+    S._capTab = name;
+    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function (t) {
+      t.classList.toggle('active', t.dataset.tab === name);
+    });
+    document.getElementById('capShoot').classList.toggle('hidden', name !== 'shoot');
+    document.getElementById('capPreview').classList.toggle('hidden', name !== 'preview');
+    if (name === 'preview') S.refreshPreview(); else S.stopPlayersKeepCamera();
+  };
+
+  S.initCamera = function () {
+    var video = document.getElementById('cam');
+    var empty = document.getElementById('capEmpty');
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      video.classList.add('hidden'); empty.classList.remove('hidden'); return;
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .then(function (stream) {
+        S._stream = stream; video.srcObject = stream; video.classList.remove('hidden'); empty.classList.add('hidden');
+      })
+      .catch(function () {
+        video.classList.add('hidden'); empty.classList.remove('hidden');
+      });
+  };
+
+  S.shoot = function () {
+    var video = document.getElementById('cam');
+    if (!S._stream || !video.videoWidth) { document.getElementById('fileInput').click(); return; }
+    var cv = document.createElement('canvas');
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    cv.getContext('2d').drawImage(video, 0, 0);
+    S.dataUrlToFrame(cv.toDataURL('image/jpeg', 0.8)).then(function (fr) {
+      S.state.frames.push(fr); S.afterFrameChange(); S.toast('찰칵! 📸 (' + S.state.frames.length + '컷)');
+    });
+  };
+
+  S.afterFrameChange = function () {
+    S.drawFrames();
+    S.updateCaptureNav();
+    if (S._capTab === 'preview') S.refreshPreview();
+    var onion = document.getElementById('onion');
+    if (onion && S.state.frames.length) {
+      onion.src = S.state.frames[S.state.frames.length - 1];
+      onion.classList.toggle('hidden', !S._stream);
+    }
+  };
+
+  S.drawFrames = function () {
+    var strip = document.getElementById('strip');
+    if (!strip) return;
+    var fr = S.state.frames;
+    if (!fr.length) { strip.innerHTML = '<div class="capture-empty" style="color:#aaa;align-self:center;">아직 찍은 컷이 없어요</div>'; return; }
+    strip.innerHTML = fr.map(function (src, i) {
+      return '<div class="frame-thumb"><span class="idx">' + (i + 1) + '</span><img src="' + src + '">' +
+        '<button class="del" data-del="' + i + '">✕</button>' +
+        '<button class="mv l" data-mv="' + i + '" data-dir="-1">◀</button>' +
+        '<button class="mv r" data-mv="' + i + '" data-dir="1">▶</button></div>';
+    }).join('');
+    Array.prototype.forEach.call(strip.querySelectorAll('[data-del]'), function (b) {
+      b.onclick = function () { S.state.frames.splice(parseInt(b.dataset.del, 10), 1); S.afterFrameChange(); };
+    });
+    Array.prototype.forEach.call(strip.querySelectorAll('[data-mv]'), function (b) {
+      b.onclick = function () {
+        var i = parseInt(b.dataset.mv, 10), j = i + parseInt(b.dataset.dir, 10);
+        if (j < 0 || j >= S.state.frames.length) return;
+        var a = S.state.frames, tmp = a[i]; a[i] = a[j]; a[j] = tmp; S.afterFrameChange();
+      };
+    });
+  };
+
+  S.refreshPreview = function () {
+    S.stopPlayersKeepCamera();
+    var cv = document.getElementById('preview');
+    if (!cv) return;
+    if (S.state.frames.length) S.playOn(cv, S.state.frames, S.state.fps);
+    else { cv.width = 480; cv.height = 360; var c = cv.getContext('2d'); c.fillStyle = '#222'; c.fillRect(0, 0, 480, 360); c.fillStyle = '#fff'; c.font = '24px Jua'; c.textAlign = 'center'; c.fillText('컷을 찍으면 여기서 움직여요', 240, 185); }
+  };
+
+  /* =========================================================
+   *  ⑤ 자기평가
+   * ========================================================= */
+  S.CHECKS = [
+    '계획한 이야기가 영상에 잘 나타나요.',
+    '컷이 2장 이상이고, 순서가 자연스러워요.',
+    '제목을 알맞게 정했어요.',
+    '친구가 보기에 불편한 내용은 없어요.'
+  ];
+  S.SELF_STARS = [
+    { key: 'creative', label: '🎨 창의성' },
+    { key: 'motion', label: '🏃 움직임' },
+    { key: 'effort', label: '💪 노력' }
+  ];
+
+  S.screenSelfEval = function () {
+    if (S.state.frames.length < 2) { S.toast('먼저 컷을 2장 이상 찍어주세요'); S.go('capture'); return; }
+    S._selfChecks = S._selfChecks || S.CHECKS.map(function () { return false; });
+    S._selfStars = S._selfStars || { creative: 0, motion: 0, effort: 0 };
+
+    S.page(
+      '<div class="eval-layout">' +
+        '<div class="eval-left">' +
+          '<canvas id="evalPreview" class="player-canvas"></canvas>' +
+          '<p class="page__sub" style="margin:0;">제목: <b>' + S.esc(S.state.plan.title) + '</b> · ' + S.state.frames.length + '컷</p>' +
+        '</div>' +
+        '<div class="eval-right">' +
+          '<h3>올리기 전에 스스로 확인해요 ✅</h3>' +
+          '<div id="checkList"></div>' +
+          '<h3 style="margin-top:.5rem;">⭐ 스스로 별점</h3>' +
+          '<div id="selfStars"></div>' +
+        '</div>' +
+      '</div>',
+      { title: '자기평가 ✅' }
+    );
+
+    S.playOn(document.getElementById('evalPreview'), S.state.frames, S.state.fps);
+
+    var cl = document.getElementById('checkList');
+    cl.innerHTML = S.CHECKS.map(function (c, i) {
+      return '<label class="check-item' + (S._selfChecks[i] ? ' checked' : '') + '" data-ci="' + i + '" style="margin-bottom:.5rem;">' +
+        '<input type="checkbox" ' + (S._selfChecks[i] ? 'checked' : '') + '><span>' + S.esc(c) + '</span></label>';
+    }).join('');
+    Array.prototype.forEach.call(cl.querySelectorAll('.check-item'), function (lab) {
+      lab.querySelector('input').onchange = function () {
+        S._selfChecks[parseInt(lab.dataset.ci, 10)] = this.checked;
+        lab.classList.toggle('checked', this.checked);
+        S.setNextDisabled(!S._selfChecks.every(Boolean));
+      };
+    });
+
+    var ss = document.getElementById('selfStars');
+    ss.innerHTML = S.SELF_STARS.map(function (row) {
+      return '<div class="peer-row"><span>' + row.label + '</span><span class="stars" data-k="' + row.key + '"></span></div>';
+    }).join('');
+    S.SELF_STARS.forEach(function (row) {
+      renderStars(ss.querySelector('[data-k="' + row.key + '"]'), S._selfStars[row.key], function (v) { S._selfStars[row.key] = v; });
+    });
+
+    S.setNav({
+      back: { label: '◀ 더 찍기', fn: S.prev },
+      center: '확인 후 올려요',
+      next: { label: '🚀 보드에 올리기', cls: 'green', disabled: !S._selfChecks.every(Boolean), fn: S.publish }
+    });
+  };
+
+  S.publish = function () {
+    var st = S.state;
+    S.loading(true, '영상을 올리는 중…');
+    S.makeThumb(st.frames[0], 150).then(function (thumb) {
+      var planText = '[이야기] ' + (st.plan.story || '') + '\n[컷 계획]\n' +
+        (st.plan.cells || []).map(function (c, i) { return (i + 1) + '. ' + (c || '-'); }).join('\n');
+      return S.call('apiSaveAnimation', {
+        studentId: st.student.id, studentName: st.student.name,
+        title: st.plan.title || '제목 없음', plan: planText,
+        fps: st.fps, frames: st.frames, thumbnail: thumb,
+        selfEval: { checks: S._selfChecks, stars: S._selfStars }
+      });
+    }).then(function () {
+      S.loading(false); S.toast('🎉 보드에 올렸어요! 친구들과 함께 봐요');
+      S._selfChecks = null; S._selfStars = null;
+      S.go('board');
+    }).catch(function (e) { S.loading(false); S.toast(S.errText(e)); });
+  };
+
+  S.resetWork = function () {
+    S.state.plan = { title: '', story: '', cells: ['', '', '', ''] };
+    S.state.frames = []; S.state.fps = 6;
+    S._selfChecks = null; S._selfStars = null;
+    S.gotoKey('plan1', 'next');
+  };
+
+  /* =========================================================
+   *  ⑥ 보드 (하트 많은 순)
+   * ========================================================= */
+  S.screenBoard = function () {
+    S.setNav({});
+    S.page(
+      '<div class="btn-row" style="justify-content:space-between;flex:none;">' +
+        '<span class="tag">❤️ 하트 많은 순</span>' +
+        '<div class="btn-row">' +
+          '<button class="btn ghost" id="refreshBtn">🔄 새로고침</button>' +
+          '<button class="btn accent" id="newWorkBtn">➕ 새 작품</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="scroll-area"><div id="boardGrid" class="board-grid"></div></div>',
+      { title: '친구들 작품 보드 🖼️', sub: '눌러서 감상하고 ❤️·⭐·💬 로 응원해요!' }
+    );
+    document.getElementById('refreshBtn').onclick = function () { S.loadBoard(true); };
+    document.getElementById('newWorkBtn').onclick = S.resetWork;
+    S.loadBoard(true);
+    S.pushTimer(setInterval(function () {
+      if (S.state.screen === 'board' && !document.getElementById('modalRoot').innerHTML) S.loadBoard(false);
+    }, 8000));
+  };
+
+  S.loadBoard = function (showSpin) {
+    if (showSpin) S.loading(true, '작품을 불러오는 중…');
+    S.call('apiListAnimations').then(function (list) {
+      S.loading(false);
+      var grid = document.getElementById('boardGrid');
+      if (!grid) return;
+      if (!list.length) {
+        grid.innerHTML = '<div class="empty-note">아직 올라온 작품이 없어요.<br>첫 번째 주인공이 되어 보세요! 🌟</div>'; return;
+      }
+      var medal = ['🥇', '🥈', '🥉'];
+      grid.innerHTML = list.map(function (a, i) {
+        var rank = i < 3 ? '<span class="rank">' + medal[i] + ' ' + (i + 1) + '위</span>' : '';
+        var thumb = a.thumbnail ? '<img class="thumb" src="' + a.thumbnail + '">' : '<div class="thumb"></div>';
+        return '<div class="vid-card" data-id="' + S.esc(a.id) + '">' + rank + thumb +
+          '<div class="meta"><h3>' + (i === 0 ? '👑 ' : '') + S.esc(a.title) + '</h3>' +
+          '<div class="by">' + S.esc(a.studentName) + ' · ' + a.frameCount + '컷</div>' +
+          '<div class="heart-line">❤️ ' + a.hearts + '</div></div></div>';
+      }).join('');
+      Array.prototype.forEach.call(grid.querySelectorAll('.vid-card'), function (c) {
+        c.onclick = function () { S.watch(c.dataset.id); };
+      });
+    }).catch(function (e) { S.loading(false); S.toast(S.errText(e)); });
+  };
+
+  /* =========================================================
+   *  감상 + 하트 + 동료평가 + 댓글
+   * ========================================================= */
+  S.PEER = [
+    { key: 'story', label: '📖 이야기가 잘 보여요' },
+    { key: 'motion', label: '🏃 움직임이 자연스러워요' },
+    { key: 'creative', label: '🎨 기발하고 창의적이에요' }
+  ];
+
+  S.modal = function (innerHTML) {
+    var root = document.getElementById('modalRoot');
+    root.innerHTML = '<div class="modal-back" id="mback"><div class="modal"><div class="modal__body">' +
+      '<button class="modal__close" id="mclose">✕</button>' + innerHTML + '</div></div></div>';
+    var close = function () { S.stopPlayersKeepCamera(); root.innerHTML = ''; if (S._onModalClose) { var f = S._onModalClose; S._onModalClose = null; f(); } };
+    document.getElementById('mclose').onclick = close;
+    document.getElementById('mback').onclick = function (e) { if (e.target.id === 'mback') close(); };
+  };
+  S.closeModal = function () { document.getElementById('modalRoot').innerHTML = ''; };
+
+  S.watch = function (animId) {
+    S.loading(true, '영상을 여는 중…');
+    S.call('apiGetAnimationDetail', animId, S.state.student.id).then(function (d) {
+      S.loading(false);
+      S._onModalClose = function () { S.loadBoard(false); };
+      S.modal(
+        '<div class="watch-grid">' +
+          '<div>' +
+            '<h2 style="margin:0 0 .2rem;">' + S.esc(d.meta.title) + '</h2>' +
+            '<div class="by" style="color:#7a7596;margin-bottom:.5rem;">만든이: ' + S.esc(d.meta.studentName) + '</div>' +
+            '<canvas id="watchCanvas" class="watch-canvas"></canvas>' +
+            '<details style="margin-top:.6rem;"><summary>📖 만든이의 계획 보기</summary><pre class="plan">' + S.esc(d.meta.plan) + '</pre></details>' +
+          '</div>' +
+          '<div>' +
+            '<div class="card" style="box-shadow:none;border:.15rem solid #f0ecfb;margin-bottom:.7rem;display:flex;align-items:center;gap:.6rem;">' +
+              '<button class="heart-btn" id="heartBtn">' + (d.hearted ? '❤️' : '🤍') + '</button>' +
+              '<b id="heartCount" style="font-size:1.5rem;color:#ff4d6d;">' + d.hearts + '</b>' +
+              '<span class="page__sub" style="margin:0;">하트로 응원!</span>' +
+            '</div>' +
+            '<div class="card" style="box-shadow:none;border:.15rem solid #f0ecfb;margin-bottom:.7rem;">' +
+              '<h3>⭐ 동료평가</h3><div id="peerStars"></div>' +
+              '<button class="btn green" id="peerSave" style="margin-top:.5rem;font-size:1rem;">평가 저장</button>' +
+              '<p class="page__sub" id="peerSummary" style="margin:.5rem 0 0;"></p>' +
+            '</div>' +
+            '<div class="card" style="box-shadow:none;border:.15rem solid #f0ecfb;">' +
+              '<h3>💬 댓글</h3><div class="comment-list" id="commentList"></div>' +
+              '<div class="btn-row" style="margin-top:.5rem;flex-wrap:nowrap;">' +
+                '<input type="text" id="commentInput" maxlength="200" placeholder="따뜻한 한마디 ✍️">' +
+                '<button class="btn" id="commentSend" style="font-size:1rem;">등록</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+        '</div>'
+      );
+
+      S.playOn(document.getElementById('watchCanvas'), d.frames, d.fps);
+
+      var heartBtn = document.getElementById('heartBtn');
+      heartBtn.onclick = function () {
+        heartBtn.disabled = true;
+        S.call('apiToggleHeart', animId, S.state.student.id).then(function (r) {
+          heartBtn.disabled = false; heartBtn.textContent = r.hearted ? '❤️' : '🤍';
+          document.getElementById('heartCount').textContent = r.hearts;
+          if (r.hearted) S.toast('하트를 보냈어요 ❤️');
+        }).catch(function (e) { heartBtn.disabled = false; S.toast(S.errText(e)); });
+      };
+
+      var my = d.myPeerEval || {};
+      var peerVals = { story: my.story || 0, motion: my.motion || 0, creative: my.creative || 0 };
+      var ps = document.getElementById('peerStars');
+      ps.innerHTML = S.PEER.map(function (row) {
+        return '<div class="peer-row"><span>' + row.label + '</span><span class="stars" data-k="' + row.key + '"></span></div>';
+      }).join('');
+      S.PEER.forEach(function (row) {
+        renderStars(ps.querySelector('[data-k="' + row.key + '"]'), peerVals[row.key], function (v) { peerVals[row.key] = v; });
+      });
+      function showPeer(sum) {
+        document.getElementById('peerSummary').textContent = (!sum || !sum.count)
+          ? '아직 평가가 없어요. 첫 평가를 남겨보세요!'
+          : '친구 ' + sum.count + '명 평균 → 이야기 ' + sum.avg.story + ' · 움직임 ' + sum.avg.motion + ' · 창의 ' + sum.avg.creative;
+      }
+      showPeer(d.peerSummary);
+      document.getElementById('peerSave').onclick = function () {
+        if (!peerVals.story && !peerVals.motion && !peerVals.creative) { S.toast('별점을 한 개 이상 눌러주세요 ⭐'); return; }
+        S.call('apiAddPeerEval', animId, S.state.student.id, S.state.student.name, peerVals).then(function () {
+          S.toast('평가를 저장했어요 ⭐');
+          return S.call('apiGetAnimationDetail', animId, S.state.student.id);
+        }).then(function (nd) { showPeer(nd.peerSummary); }).catch(function (e) { S.toast(S.errText(e)); });
+      };
+
+      S.renderComments(d.comments);
+      var input = document.getElementById('commentInput');
+      var send = function () {
+        var text = (input.value || '').trim();
+        if (!text) return;
+        document.getElementById('commentSend').disabled = true;
+        S.call('apiAddComment', animId, S.state.student.id, S.state.student.name, text).then(function (c) {
+          input.value = ''; document.getElementById('commentSend').disabled = false;
+          d.comments = d.comments.concat([c]); S.renderComments(d.comments);
+        }).catch(function (e) { document.getElementById('commentSend').disabled = false; S.toast(S.errText(e)); });
+      };
+      document.getElementById('commentSend').onclick = send;
+      input.onkeydown = function (e) { if (e.key === 'Enter') send(); };
+    }).catch(function (e) { S.loading(false); S.toast(S.errText(e)); });
+  };
+
+  S.renderComments = function (comments) {
+    var box = document.getElementById('commentList');
+    if (!box) return;
+    if (!comments.length) { box.innerHTML = '<p class="page__sub" style="margin:0;">아직 댓글이 없어요. 첫 댓글을 남겨보세요!</p>'; return; }
+    box.innerHTML = comments.map(function (c) {
+      return '<div class="comment"><span class="who">' + S.esc(c.studentName) + '</span> ' + S.esc(c.text) + '</div>';
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  };
+
+  /* =========================================================
+   *  선생님 설정
+   * ========================================================= */
+  S.teacherSettings = function () {
+    S.modal(
+      '<h2>⚙️ 선생님 설정</h2>' +
+      '<p class="page__sub">선생님 비밀번호를 입력하세요. (처음: 1234)</p>' +
+      '<input type="password" id="pinInput" placeholder="비밀번호" style="max-width:16rem;">' +
+      '<div class="btn-row" style="margin-top:.7rem;"><button class="btn" id="pinOk">들어가기</button></div>'
+    );
+    var go = function () {
+      S.call('apiVerifyPin', document.getElementById('pinInput').value).then(function (ok) {
+        if (!ok) { S.toast('비밀번호가 맞지 않아요'); return; }
+        S._pin = document.getElementById('pinInput').value; S.teacherPanel();
+      }).catch(function (e) { S.toast(S.errText(e)); });
+    };
+    document.getElementById('pinOk').onclick = go;
+    document.getElementById('pinInput').onkeydown = function (e) { if (e.key === 'Enter') go(); };
+  };
+
+  S.teacherPanel = function () {
+    S.call('apiGetRoster').then(function (roster) {
+      var text = roster.map(function (r) { return r.number + ',' + r.name; }).join('\n');
+      S.modal(
+        '<h2>⚙️ 선생님 설정</h2>' +
+        '<div class="card" style="box-shadow:none;border:.15rem solid #f0ecfb;margin-bottom:.7rem;">' +
+          '<h3>👥 학생 명단</h3>' +
+          '<p class="page__sub">한 줄에 한 명씩. <b>번호,이름</b> 또는 <b>이름</b>만 적어도 돼요.</p>' +
+          '<textarea id="rosterText" rows="7" placeholder="1,김하늘\n2,이보람\n3,박솔">' + S.esc(text) + '</textarea>' +
+          '<div class="btn-row" style="margin-top:.6rem;"><button class="btn green" id="saveRoster">명단 저장</button></div>' +
+          '<hr style="border:none;border-top:.1rem dashed #e3def5;margin:.9rem 0;">' +
+          '<h3>📑 구글 시트에서 가져오기</h3>' +
+          '<input type="text" id="sheetUrl" placeholder="https://docs.google.com/spreadsheets/d/.../edit">' +
+          '<div class="btn-row" style="margin-top:.6rem;"><button class="btn ghost" id="importSheet">시트에서 가져오기</button></div>' +
+        '</div>' +
+        '<div class="card" style="box-shadow:none;border:.15rem solid #f0ecfb;">' +
+          '<h3>🔒 비밀번호 바꾸기</h3>' +
+          '<input type="password" id="newPin" placeholder="새 비밀번호 (4자리 이상)" style="max-width:18rem;">' +
+          '<div class="btn-row" style="margin-top:.6rem;"><button class="btn ghost" id="changePin">변경</button></div>' +
+        '</div>'
+      );
+      document.getElementById('saveRoster').onclick = function () {
+        S.loading(true, '명단 저장 중…');
+        S.call('apiSetRoster', S._pin, document.getElementById('rosterText').value).then(function (r) {
+          S.loading(false); S.toast(r.length + '명 저장 완료! ✅'); S.closeModal();
+          if (S.state.screen === 'entry') S.go('entry');
+        }).catch(function (e) { S.loading(false); S.toast(S.errText(e)); });
+      };
+      document.getElementById('importSheet').onclick = function () {
+        var url = (document.getElementById('sheetUrl').value || '').trim();
+        if (!url) { S.toast('시트 주소를 붙여넣어 주세요'); return; }
+        S.loading(true, '시트에서 가져오는 중…');
+        S.call('apiImportRosterFromSheet', S._pin, url).then(function (r) {
+          S.loading(false); S.toast(r.length + '명 가져왔어요! ✅');
+          document.getElementById('rosterText').value = r.map(function (x) { return x.number + ',' + x.name; }).join('\n');
+        }).catch(function (e) { S.loading(false); S.toast(S.errText(e)); });
+      };
+      document.getElementById('changePin').onclick = function () {
+        S.call('apiChangePin', S._pin, document.getElementById('newPin').value).then(function () {
+          S._pin = document.getElementById('newPin').value; S.toast('비밀번호를 바꿨어요 🔒');
+        }).catch(function (e) { S.toast(S.errText(e)); });
+      };
+    }).catch(function (e) { S.toast(S.errText(e)); });
+  };
+
+  /* ---------- 부팅 ---------- */
+  S.boot = function () {
+    S.bootCommon();
+    if (S.state.student) S.gotoKey('home', 'next'); else S.gotoKey('entry', 'next');
+  };
+
+})(window.S);
+
+
+/* =========================================================
+ *  오프라인 미리보기용 모의 데이터 (구글에 배포하면 사용 안 함)
+ * ========================================================= */
+var MOCK = (function () {
+  var KEY = 'anim_mock_v1';
+  function load() { try { return JSON.parse(localStorage.getItem(KEY)) || null; } catch (e) { return null; } }
+  function save(db) { localStorage.setItem(KEY, JSON.stringify(db)); }
+  function frame(emoji, dx) {
+    var cv = document.createElement('canvas'); cv.width = 240; cv.height = 180;
+    var c = cv.getContext('2d'); c.fillStyle = '#fff7ff'; c.fillRect(0, 0, 240, 180);
+    c.font = '70px serif'; c.textAlign = 'center'; c.fillText(emoji, 60 + dx, 120);
+    return cv.toDataURL('image/jpeg', 0.6);
+  }
+  function frames(emoji) { return [frame(emoji, 0), frame(emoji, 30), frame(emoji, 60), frame(emoji, 100), frame(emoji, 140)]; }
+  function db() {
+    var d = load();
+    if (d) return d;
+    d = {
+      roster: [
+        { id: 'r1', number: 1, name: '김하늘' }, { id: 'r2', number: 2, name: '이보람' },
+        { id: 'r3', number: 3, name: '박솔' }, { id: 'r4', number: 4, name: '최바다' },
+        { id: 'r5', number: 5, name: '정한결' }, { id: 'r6', number: 6, name: '윤다온' }
+      ],
+      anims: [
+        { id: 'm1', studentId: 'r1', studentName: '김하늘', title: '굴러가는 공', plan: '[이야기] 공이 굴러간다', fps: 6, frames: frames('⚽'), thumbnail: frame('⚽', 0), selfEval: {}, createdAt: 1000 },
+        { id: 'm2', studentId: 'r2', studentName: '이보람', title: '날아가는 로켓', plan: '[이야기] 로켓이 난다', fps: 8, frames: frames('🚀'), thumbnail: frame('🚀', 0), selfEval: {}, createdAt: 2000 }
+      ],
+      comments: [{ id: 'c1', animId: 'm1', studentId: 'r3', studentName: '박솔', text: '공이 진짜 굴러가는 것 같아!', createdAt: 1500 }],
+      hearts: [{ animId: 'm2', studentId: 'r1' }, { animId: 'm2', studentId: 'r3' }, { animId: 'm1', studentId: 'r2' }],
+      peerEvals: []
+    };
+    save(d); return d;
+  }
+  function heartsFor(id) { return db().hearts.filter(function (h) { return h.animId === id; }).length; }
+  return {
+    apiGetConfig: function () { return { rosterLoaded: db().roster.length > 0, rosterCount: db().roster.length, dataUrl: '#mock' }; },
+    apiGetRoster: function () { return db().roster.map(function (r) { return { id: r.id, number: r.number, name: r.name }; }); },
+    apiVerifyPin: function (pin) { return String(pin) === '1234'; },
+    apiChangePin: function () { return true; },
+    apiSetRoster: function (pin, text) {
+      var d = db(), rows = [], n = 0;
+      String(text).split(/\r?\n/).forEach(function (line) {
+        line = line.trim(); if (!line) return; n++;
+        var num = n, name = line, m = line.split(',');
+        if (m.length >= 2 && /^\d+$/.test(m[0].trim())) { num = parseInt(m[0], 10); name = m.slice(1).join(',').trim(); }
+        rows.push({ id: 'r' + Math.random().toString(36).slice(2, 7), number: num, name: name });
+      });
+      d.roster = rows; save(d); return MOCK.apiGetRoster();
+    },
+    apiImportRosterFromSheet: function () { throw new Error('미리보기에서는 시트 가져오기를 쓸 수 없어요(배포 후 사용).'); },
+    apiSaveAnimation: function (p) {
+      var d = db(), id = 'm' + Math.random().toString(36).slice(2, 8);
+      d.anims.push({ id: id, studentId: p.studentId, studentName: p.studentName, title: p.title, plan: p.plan, fps: p.fps, frames: p.frames, thumbnail: p.thumbnail, selfEval: p.selfEval, createdAt: d.anims.length + 3000 });
+      save(d); return { id: id };
+    },
+    apiListAnimations: function () {
+      return db().anims.map(function (a) {
+        return { id: a.id, studentId: a.studentId, studentName: a.studentName, title: a.title, fps: a.fps, frameCount: a.frames.length, thumbnail: a.thumbnail, hearts: heartsFor(a.id), createdAt: a.createdAt };
+      }).sort(function (x, y) { return y.hearts - x.hearts || y.createdAt - x.createdAt; });
+    },
+    apiGetAnimationDetail: function (animId, viewerId) {
+      var d = db(), a = d.anims.filter(function (x) { return x.id === animId; })[0];
+      if (!a) throw new Error('작품을 찾을 수 없어요.');
+      var peer = d.peerEvals.filter(function (p) { return p.animId === animId; });
+      var sums = { story: 0, motion: 0, creative: 0 };
+      peer.forEach(function (p) { sums.story += p.ratings.story || 0; sums.motion += p.ratings.motion || 0; sums.creative += p.ratings.creative || 0; });
+      var cnt = peer.length;
+      var avg = { story: cnt ? Math.round(sums.story / cnt * 10) / 10 : 0, motion: cnt ? Math.round(sums.motion / cnt * 10) / 10 : 0, creative: cnt ? Math.round(sums.creative / cnt * 10) / 10 : 0 };
+      var mine = peer.filter(function (p) { return p.studentId === viewerId; })[0];
+      return {
+        meta: { id: a.id, studentName: a.studentName, title: a.title, plan: a.plan, selfEval: a.selfEval },
+        fps: a.fps, frames: a.frames, hearts: heartsFor(animId),
+        hearted: d.hearts.some(function (h) { return h.animId === animId && h.studentId === viewerId; }),
+        comments: d.comments.filter(function (c) { return c.animId === animId; }),
+        peerSummary: { count: cnt, avg: avg }, myPeerEval: mine ? mine.ratings : null
+      };
+    },
+    apiToggleHeart: function (animId, sid) {
+      var d = db(), idx = -1;
+      d.hearts.forEach(function (h, i) { if (h.animId === animId && h.studentId === sid) idx = i; });
+      if (idx >= 0) d.hearts.splice(idx, 1); else d.hearts.push({ animId: animId, studentId: sid });
+      save(d); return { hearted: idx < 0, hearts: heartsFor(animId) };
+    },
+    apiAddComment: function (animId, sid, name, text) {
+      var d = db(), c = { id: 'c' + Math.random().toString(36).slice(2, 7), animId: animId, studentId: sid, studentName: name, text: text, createdAt: Date.now() };
+      d.comments.push(c); save(d); return { id: c.id, studentName: name, text: text, createdAt: c.createdAt };
+    },
+    apiAddPeerEval: function (animId, sid, name, ratings) {
+      var d = db(), ex = d.peerEvals.filter(function (p) { return p.animId === animId && p.studentId === sid; })[0];
+      if (ex) ex.ratings = ratings; else d.peerEvals.push({ animId: animId, studentId: sid, studentName: name, ratings: ratings });
+      save(d); return { updated: !!ex };
+    }
+  };
+})();
+
+/* ---- MOCK 까지 모두 준비된 뒤에 앱 시작 ---- */
+(function () {
+  function start() { window.S.boot(); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
+</script>
+<!-- Studio.html 끝 -->
